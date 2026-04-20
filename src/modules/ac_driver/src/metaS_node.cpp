@@ -133,6 +133,9 @@ public:
    * @brief Destructor cleans up the device object.
    */
   ~MSPublisher() {
+#if defined(ROS2_FOUND)
+    stopGraphWatchThread();
+#endif // defined(ROS2_FOUND)
     stopDeviceManager();
 
     stopRgbWorkThreads();
@@ -174,6 +177,18 @@ public:
           "Initial Driver Device Manager Successed ! ";
       RS_SPDLOG_INFO(error_info);
     }
+
+#if defined(ROS2_FOUND)
+    ret = initGraphWatchThread();
+    if (ret != 0) {
+      const std::string &error_info =
+          "Initial Graph Watch Thread Failed: ret = " + std::to_string(ret);
+      RS_SPDLOG_ERROR(error_info);
+      return -3;
+    } else {
+      RS_SPDLOG_INFO("Initial Graph Watch Thread Successed !");
+    }
+#endif // defined(ROS2_FOUND)
 
     // GMSL Open
     if (device_interface_type ==
@@ -915,6 +930,59 @@ private:
     return 0;
   }
 
+#if defined(ROS2_FOUND)
+  int initGraphWatchThread() {
+    try {
+      is_graph_watch_running_ = true;
+      graph_watch_thread_ptr.reset(
+          new std::thread(&MSPublisher::graphWatchWorkThread, this));
+    } catch (...) {
+      is_graph_watch_running_ = false;
+      RS_SPDLOG_ERROR("Create Graph Watch Thread Failed !");
+      return -1;
+    }
+    return 0;
+  }
+
+  int stopGraphWatchThread() {
+    if (is_graph_watch_running_) {
+      is_graph_watch_running_ = false;
+    }
+    if (graph_watch_thread_ptr && graph_watch_thread_ptr->joinable()) {
+      graph_watch_thread_ptr->join();
+    }
+    graph_watch_thread_ptr.reset();
+    return 0;
+  }
+
+  void graphWatchWorkThread() {
+    auto graph_event = this->get_graph_event();
+    while (is_graph_watch_running_) {
+      try {
+        this->wait_for_graph_change(graph_event, std::chrono::milliseconds(500));
+      } catch (const std::exception &e) {
+        if (is_graph_watch_running_) {
+          RS_SPDLOG_WARN("Wait For Graph Change Failed: {}", e.what());
+        }
+        break;
+      } catch (...) {
+        if (is_graph_watch_running_) {
+          RS_SPDLOG_WARN("Wait For Graph Change Failed By Unknown Error !");
+        }
+        break;
+      }
+      if (!is_graph_watch_running_) {
+        break;
+      }
+      if (!graph_event->check_and_clear()) {
+        continue;
+      }
+      updateDevicePauseState();
+    }
+    RS_SPDLOG_INFO("Graph Watch Thread Exit !");
+  }
+#endif // defined(ROS2_FOUND)
+
   int initTopicNames() {
     topic_name = topic_prefix + "/rs_camera/color/image_raw";
     left_topic_name = topic_prefix + "/rs_camera/left/color/image_raw";
@@ -956,13 +1024,29 @@ private:
 #endif // defined(ROS_ROS2_FOUND)
   create_ros_publisher(const std::string &topic_name, const uint32_t depth) {
 #if defined(ROS_FOUND)
-    auto publisherPtr =
-        robosense::interface::RSRosManager::create_publisher<ROS_MESSAGE_TYPE>(
-            nh, topic_name, depth);
+    ros::SubscriberStatusCallback connect_cb =
+        [this](const ros::SingleSubscriberPublisher &) {
+          this->updateDevicePauseState();
+        };
+    ros::SubscriberStatusCallback disconnect_cb =
+        [this](const ros::SingleSubscriberPublisher &) {
+          this->updateDevicePauseState();
+        };
+    std::shared_ptr<ros::Publisher> publisherPtr;
+    try {
+      publisherPtr = std::make_shared<ros::Publisher>();
+    } catch (...) {
+      RS_SPDLOG_ERROR(std::string("Create TopicName = ") + topic_name +
+                      " Failed !");
+      return nullptr;
+    }
+    *publisherPtr =
+        nh.advertise<ROS_MESSAGE_TYPE>(topic_name, depth, connect_cb,
+                                       disconnect_cb);
 #elif defined(ROS2_FOUND)
     auto publisherPtr =
-        robosense::interface::RSRosManager::create_publisher<ROS_MESSAGE_TYPE>(
-            this, topic_name, rclcpp::QoS(depth));
+        this->create_publisher<ROS_MESSAGE_TYPE>(topic_name,
+                                                 rclcpp::QoS(depth));
 #endif // defined(ROS_ROS2_FOUND)
     if (publisherPtr == nullptr) {
       RS_SPDLOG_ERROR(std::string("Create TopicName = ") + topic_name +
@@ -1140,6 +1224,107 @@ private:
     }
 
     return 0;
+  }
+
+#if defined(ROS_FOUND)
+  template <typename PublisherT>
+  size_t
+  getPublisherSubscriberCount(
+      const std::shared_ptr<PublisherT> &publisher) const {
+    return publisher ? publisher->getNumSubscribers() : 0;
+  }
+#elif defined(ROS2_FOUND)
+  template <typename PublisherT>
+  size_t
+  getPublisherSubscriberCount(
+      const std::shared_ptr<PublisherT> &publisher) const {
+    if (!publisher) {
+      return 0;
+    }
+    return publisher->get_subscription_count() +
+           publisher->get_intra_process_subscription_count();
+  }
+#endif // defined(ROS_ROS2_FOUND)
+
+  template <typename PublisherT>
+  bool
+  hasPublisherSubscribers(const std::shared_ptr<PublisherT> &publisher) const {
+    return getPublisherSubscriberCount(publisher) > 0;
+  }
+
+  bool hasAnySubscribers() const {
+    if (hasPublisherSubscribers(publisher_camera_info) ||
+        hasPublisherSubscribers(publisher_left_camera_info) ||
+        hasPublisherSubscribers(publisher_right_camera_info) ||
+        hasPublisherSubscribers(publisher_rgb) ||
+        hasPublisherSubscribers(publisher_rgb_left) ||
+        hasPublisherSubscribers(publisher_rgb_right) ||
+        hasPublisherSubscribers(publisher_rgb_rectify) ||
+        hasPublisherSubscribers(publisher_rgb_rectify_left) ||
+        hasPublisherSubscribers(publisher_rgb_rectify_right) ||
+        hasPublisherSubscribers(publisher_depth) ||
+        hasPublisherSubscribers(publisher_depth_ac2_wave2) ||
+        hasPublisherSubscribers(publisher_imu) ||
+        hasPublisherSubscribers(publisher_jpeg) ||
+        hasPublisherSubscribers(publisher_jpeg_left) ||
+        hasPublisherSubscribers(publisher_jpeg_right) ||
+        hasPublisherSubscribers(publisher_jpeg_rectify) ||
+        hasPublisherSubscribers(publisher_jpeg_rectify_left) ||
+        hasPublisherSubscribers(publisher_jpeg_rectify_right) ||
+        hasPublisherSubscribers(publisher_device_calib_info)) {
+      return true;
+    }
+#if defined(ROS2_FOUND)
+    return hasPublisherSubscribers(publisher_rgb_loan) ||
+           hasPublisherSubscribers(publisher_rgb_left_loan) ||
+           hasPublisherSubscribers(publisher_rgb_right_loan) ||
+           hasPublisherSubscribers(publisher_rgb_rectify_loan) ||
+           hasPublisherSubscribers(publisher_rgb_rectify_left_loan) ||
+           hasPublisherSubscribers(publisher_rgb_rectify_right_loan) ||
+           hasPublisherSubscribers(publisher_depth_loan) ||
+           hasPublisherSubscribers(publisher_depth_ac2_loan) ||
+           hasPublisherSubscribers(publisher_depth_ac2_wave2_loan);
+#else
+    return false;
+#endif // defined(ROS2_FOUND)
+  }
+
+  void updateDevicePauseState() {
+    std::string device_uuid;
+    {
+      std::lock_guard<std::mutex> lg(current_device_uuid_mtx);
+      if (current_device_uuid.empty()) {
+        return;
+      }
+      device_uuid = current_device_uuid;
+    }
+
+    if (!device_manager_ptr) {
+      return;
+    }
+
+    const bool should_pause = !hasAnySubscribers();
+    {
+      std::lock_guard<std::mutex> lg(device_pause_state_mtx);
+      if (current_device_pause_state == should_pause) {
+        return;
+      }
+    }
+
+    const int ret = device_manager_ptr->pauseDevice(device_uuid, should_pause);
+    if (ret != 0) {
+      RS_SPDLOG_WARN("Update Device Pause State Failed: uuid = " + device_uuid +
+                     ", pause = " + std::to_string(should_pause) +
+                     ", ret = " + std::to_string(ret));
+    } else {
+      {
+        std::lock_guard<std::mutex> lg(device_pause_state_mtx);
+        current_device_pause_state = should_pause;
+      }
+      RS_SPDLOG_INFO("Device uuid = " + device_uuid +
+                     (should_pause ? " Pause" : " Resume") +
+                     " By Subscriber State Successed !");
+    }
   }
 
   int initImageBuffer() {
@@ -1827,6 +2012,28 @@ private:
     return 0;
   }
 
+  template <typename QueueT>
+  void clearProcessingQueue(QueueT &queue, std::mutex &mtx) {
+    std::lock_guard<std::mutex> lock(mtx);
+    QueueT empty;
+    queue.swap(empty);
+  }
+
+  void clearProcessingQueues() {
+    clearProcessingQueue(rgb_queue_, rgb_mutex_);
+    clearProcessingQueue(rgb_left_queue_, rgb_left_mutex_);
+    clearProcessingQueue(rgb_right_queue_, rgb_right_mutex_);
+    clearProcessingQueue(rgb_rectify_queue_, rgb_rectify_mutex_);
+    clearProcessingQueue(rgb_rectify_left_queue_, rgb_rectify_left_mutex_);
+    clearProcessingQueue(rgb_rectify_right_queue_, rgb_rectify_right_mutex_);
+    clearProcessingQueue(jpeg_queue_, jpeg_mutex_);
+    clearProcessingQueue(jpeg_left_queue_, jpeg_left_mutex_);
+    clearProcessingQueue(jpeg_right_queue_, jpeg_right_mutex_);
+    clearProcessingQueue(jpeg_rectify_queue_, jpeg_rectify_mutex_);
+    clearProcessingQueue(jpeg_rectify_left_queue_, jpeg_rectify_left_mutex_);
+    clearProcessingQueue(jpeg_rectify_right_queue_, jpeg_rectify_right_mutex_);
+  }
+
   void checkInputFrequence() {
     int new_image_input_fps = 30;
     int new_imu_input_fps = 200;
@@ -2033,6 +2240,10 @@ private:
       current_device_uuid = uuid;
       RS_SPDLOG_INFO("Device uuid = " + uuid + " Open Successed !");
     }
+    {
+      std::lock_guard<std::mutex> lg(device_pause_state_mtx);
+      current_device_pause_state = false;
+    }
 
     // Initial Device Calibration Info Thread
     ret = initDeviceCalibInfoWorkThread();
@@ -2042,6 +2253,8 @@ private:
                       std::to_string(ret));
       return -9;
     }
+
+    updateDevicePauseState();
 
     return 0;
   }
@@ -2079,6 +2292,8 @@ private:
       return -4;
     }
 
+    clearProcessingQueues();
+
     // 关闭JpegEncoder
     ret = stopJpegEncoder();
     if (ret != 0) {
@@ -2115,6 +2330,10 @@ private:
       left_camera_rectify_map_valid = false;
       right_camera_rectify_map_valid = false;
       RS_SPDLOG_INFO("Device uuid = " + uuid + " Close Successed !");
+    }
+    {
+      std::lock_guard<std::mutex> lg(device_pause_state_mtx);
+      current_device_pause_state = false;
     }
 
     return 0;
@@ -2236,8 +2455,10 @@ private:
           // 更新timestamp日志中的timestamp_ns
           timestampPtr->timestamp_ns = mono_timestamp_ns;
           std::lock_guard<std::mutex> lock(rgb_mutex_);
-          rgb_queue_.push({msgPtr, timestampPtr});
-          rgb_condition_.notify_one();
+          if (is_rgb_running_) {
+            rgb_queue_.push({msgPtr, timestampPtr});
+            rgb_condition_.notify_one();
+          }
         }
 
       } else if (lidar_type == robosense::lidar::LidarType::RS_AC2) {
@@ -2247,18 +2468,22 @@ private:
           // 更新timestamp日志中的timestamp_ns
           timestampPtr->timestamp_ns = stereo_left_timestamp_ns;
           std::lock_guard<std::mutex> lock(rgb_left_mutex_);
-          rgb_left_queue_.push({msgPtr, timestampPtr});
-          rgb_left_condition_.notify_one();
+          if (is_rgb_left_running_) {
+            rgb_left_queue_.push({msgPtr, timestampPtr});
+            rgb_left_condition_.notify_one();
+          }
         }
         // 右相机: rgb
         if (enable_ac2_right_image_send) {
-          robosense::device::RSTimestampItem::Ptr rightItemstampPtr(
-              new robosense::device::RSTimestampItem(*timestampPtr));
-          // 更新timestamp日志中的timestamp_ns
-          rightItemstampPtr->timestamp_ns = stereo_right_timestamp_ns;
           std::lock_guard<std::mutex> lock(rgb_right_mutex_);
-          rgb_right_queue_.push({msgPtr, rightItemstampPtr});
-          rgb_right_condition_.notify_one();
+          if (is_rgb_right_running_) {
+            robosense::device::RSTimestampItem::Ptr rightItemstampPtr(
+                new robosense::device::RSTimestampItem(*timestampPtr));
+            // 更新timestamp日志中的timestamp_ns
+            rightItemstampPtr->timestamp_ns = stereo_right_timestamp_ns;
+            rgb_right_queue_.push({msgPtr, rightItemstampPtr});
+            rgb_right_condition_.notify_one();
+          }
         }
       }
     }
@@ -4782,6 +5007,12 @@ private:
       jpeg_rectify_right_queue_;
   bool is_jpeg_rectify_right_running_ = false;
 
+#if defined(ROS2_FOUND)
+private:
+  bool is_graph_watch_running_ = false;
+  std::shared_ptr<std::thread> graph_watch_thread_ptr;
+#endif // defined(ROS2_FOUND)
+
 private:
   // DeviceInfo 处理线程
   bool is_device_info_running_ = false;
@@ -4830,6 +5061,8 @@ private:
   std::shared_ptr<robosense::device::DeviceManager> device_manager_ptr;
   std::mutex current_device_uuid_mtx;
   std::string current_device_uuid;
+  std::mutex device_pause_state_mtx;
+  bool current_device_pause_state = false;
   bool current_device_info_ready = false;
   bool current_device_info_valid = false;
   robosense::lidar::DeviceInfo current_device_info;
