@@ -21,7 +21,7 @@
  *
  * This node retrieves data from a metaS device and publishes it to ROS/ROS2
  * topics:
- * - RGB images on the "/rs_camera/rgb" topic
+ * - RGB images on the "/rs_camera/color/image_raw" topic
  * - Depth point clouds on the "/rs_lidar/points" topic
  * - IMU data on the "/rs_imu" topic
  */
