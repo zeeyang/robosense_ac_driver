@@ -213,17 +213,20 @@ find_package(yaml-cpp REQUIRED)
 #
 # CUDA 
 #
-set(enable_use_cuda_gpu true)
-if(enable_use_cuda_gpu)
-    find_package(CUDA QUIET)
-    if(CUDA_FOUND)
-        add_definitions(-DENABLE_USE_CUDA)
-        message(STATUS "CUDA found - version: ${CUDA_VERSION}")
-        include_directories(${CUDA_INCLUDE_DIRS})
-    endif(CUDA_FOUND)  
+option(AC_DRIVER_ENABLE_CUDA "Build AC driver GPUJPEG CUDA codec support" OFF)
+if(AC_DRIVER_ENABLE_CUDA)
+    find_package(CUDA REQUIRED)
+    if(NOT CUDA_NVCC_EXECUTABLE)
+        message(FATAL_ERROR "AC_DRIVER_ENABLE_CUDA=ON but nvcc was not found")
+    endif()
+    add_definitions(-DENABLE_USE_CUDA)
+    message(STATUS "AC driver CUDA codec enabled - version: ${CUDA_VERSION}")
+    include_directories(${CUDA_INCLUDE_DIRS})
 else() 
-     message("disable gpu !")
-endif(enable_use_cuda_gpu) 
+    set(CUDA_FOUND FALSE)
+    set(CUDA_NVCC_EXECUTABLE "")
+    message(STATUS "AC driver CUDA codec disabled")
+endif() 
 
 #
 # RK3588: RGA 
